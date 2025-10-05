@@ -238,5 +238,5 @@ This project is private and proprietary.
 ---
 
 <div align="center">
-  <p>Built with ❤️ using modern web technologies</p>
+  <p>Built with ❤️ </p>
 </div>
