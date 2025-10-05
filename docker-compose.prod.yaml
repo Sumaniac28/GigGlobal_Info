@@ -1,0 +1,469 @@
+# Production Docker Compose Configuration for GigGlobal
+# Usage: docker-compose -f docker-compose.prod.yaml up -d
+
+version: '3.9'
+
+services:
+  
+  redis:
+    container_name: gigglobal_redis_prod
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD:-secure_redis_password}
+    ports:
+      - '6379:6379'
+    volumes:
+      - redis_data:/data
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-secure_redis_password}
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - gigglobal_network
+
+  mongodb:
+    container_name: gigglobal_mongodb_prod
+    image: mongo:7
+    restart: unless-stopped
+    ports:
+      - '27017:27017'
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=${MONGO_ROOT_USERNAME:-admin}
+      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_ROOT_PASSWORD:-secure_mongo_password}
+      - MONGO_INITDB_DATABASE=gigglobal
+    volumes:
+      - mongodb_data:/data/db
+      - mongodb_config:/data/configdb
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - gigglobal_network
+
+  mysql:
+    container_name: gigglobal_mysql_prod
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD:-secure_mysql_root_password}
+      - MYSQL_DATABASE=gigglobal_auth
+      - MYSQL_USER=${MYSQL_USER:-gigglobal}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD:-secure_mysql_password}
+    ports:
+      - '3306:3306'
+    volumes:
+      - mysql_data:/var/lib/mysql
+    command: --default-authentication-plugin=mysql_native_password
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - gigglobal_network
+
+  postgres:
+    container_name: gigglobal_postgres_prod
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=gigglobal_reviews
+      - POSTGRES_USER=${POSTGRES_USER:-gigglobal}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-secure_postgres_password}
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gigglobal}"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - gigglobal_network
+
+  rabbitmq:
+    container_name: gigglobal_rabbitmq_prod
+    image: rabbitmq:3.12-management-alpine
+    restart: unless-stopped
+    environment:
+      - RABBITMQ_DEFAULT_USER=${RABBITMQ_USER:-admin}
+      - RABBITMQ_DEFAULT_PASS=${RABBITMQ_PASSWORD:-secure_rabbitmq_password}
+      - RABBITMQ_DEFAULT_VHOST=gigglobal
+    ports:
+      - '5672:5672'   # AMQP port
+      - '15672:15672' # Management UI port
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: rabbitmq-diagnostics -q ping
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - gigglobal_network
+
+  elasticsearch:
+    container_name: gigglobal_elasticsearch_prod
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.17.0
+    restart: unless-stopped
+    environment:
+      - node.name=elasticsearch
+      - cluster.name=gigglobal-cluster
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - "ES_JAVA_OPTS=-Xms2g -Xmx2g"
+      - xpack.security.enabled=true
+      - xpack.security.authc.api_key.enabled=true
+      - xpack.monitoring.collection.enabled=true
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD:-secure_elastic_password}
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    ports:
+      - '9200:9200'
+    healthcheck:
+      test: curl -s http://localhost:9200 >/dev/null || exit 1
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - gigglobal_network
+
+  kibana:
+    container_name: gigglobal_kibana_prod
+    image: docker.elastic.co/kibana/kibana:8.17.0
+    restart: unless-stopped
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - ELASTICSEARCH_USERNAME=kibana_system
+      - ELASTICSEARCH_PASSWORD=${KIBANA_PASSWORD:-secure_kibana_password}
+    ports:
+      - '5601:5601'
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test: curl -s http://localhost:5601 >/dev/null || exit 1
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - gigglobal_network
+  
+  nginx:
+    container_name: gigglobal_nginx_prod
+    image: nginx:alpine
+    restart: unless-stopped
+    ports:
+      - '80:80'
+      - '443:443'
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - nginx_logs:/var/log/nginx
+    depends_on:
+      - gateway
+      - client
+    networks:
+      - gigglobal_network
+  
+  gateway:
+    container_name: gigglobal_gateway_prod
+    build:
+      context: ../server/1-gateway-service
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - PORT=4000
+      - REDIS_URL=redis://redis:6379
+      - RABBITMQ_URL=amqp://${RABBITMQ_USER:-admin}:${RABBITMQ_PASSWORD:-secure_rabbitmq_password}@rabbitmq:5672/gigglobal
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
+    expose:
+      - "4000"
+    depends_on:
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - gigglobal_network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+
+  notifications:
+    container_name: gigglobal_notifications_prod
+    build:
+      context: ../server/2-notification-service
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - PORT=4001
+      - RABBITMQ_URL=amqp://${RABBITMQ_USER:-admin}:${RABBITMQ_PASSWORD:-secure_rabbitmq_password}@rabbitmq:5672/gigglobal
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
+    expose:
+      - "4001"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - gigglobal_network
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 128M
+
+  auth:
+    container_name: gigglobal_auth_prod
+    build:
+      context: ../server/3-auth-service
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - PORT=4002
+      - MYSQL_URL=mysql://${MYSQL_USER:-gigglobal}:${MYSQL_PASSWORD:-secure_mysql_password}@mysql:3306/gigglobal_auth
+      - RABBITMQ_URL=amqp://${RABBITMQ_USER:-admin}:${RABBITMQ_PASSWORD:-secure_rabbitmq_password}@rabbitmq:5672/gigglobal
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
+    expose:
+      - "4002"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - gigglobal_network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+
+  users:
+    container_name: gigglobal_users_prod
+    build:
+      context: ../server/4-users-service
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - PORT=4003
+      - MONGODB_URL=mongodb://${MONGO_ROOT_USERNAME:-admin}:${MONGO_ROOT_PASSWORD:-secure_mongo_password}@mongodb:27017/gigglobal
+      - REDIS_URL=redis://redis:6379
+      - RABBITMQ_URL=amqp://${RABBITMQ_USER:-admin}:${RABBITMQ_PASSWORD:-secure_rabbitmq_password}@rabbitmq:5672/gigglobal
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
+    expose:
+      - "4003"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - gigglobal_network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+
+  gig:
+    container_name: gigglobal_gig_prod
+    build:
+      context: ../server/5-gig-service
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - PORT=4004
+      - MONGODB_URL=mongodb://${MONGO_ROOT_USERNAME:-admin}:${MONGO_ROOT_PASSWORD:-secure_mongo_password}@mongodb:27017/gigglobal
+      - REDIS_URL=redis://redis:6379
+      - RABBITMQ_URL=amqp://${RABBITMQ_USER:-admin}:${RABBITMQ_PASSWORD:-secure_rabbitmq_password}@rabbitmq:5672/gigglobal
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
+    expose:
+      - "4004"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - gigglobal_network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+
+  chat:
+    container_name: gigglobal_chat_prod
+    build:
+      context: ../server/6-chat-service
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - PORT=4005
+      - MONGODB_URL=mongodb://${MONGO_ROOT_USERNAME:-admin}:${MONGO_ROOT_PASSWORD:-secure_mongo_password}@mongodb:27017/gigglobal
+      - RABBITMQ_URL=amqp://${RABBITMQ_USER:-admin}:${RABBITMQ_PASSWORD:-secure_rabbitmq_password}@rabbitmq:5672/gigglobal
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
+    expose:
+      - "4005"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - gigglobal_network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+
+  order:
+    container_name: gigglobal_order_prod
+    build:
+      context: ../server/7-order-service
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - PORT=4006
+      - MONGODB_URL=mongodb://${MONGO_ROOT_USERNAME:-admin}:${MONGO_ROOT_PASSWORD:-secure_mongo_password}@mongodb:27017/gigglobal
+      - RABBITMQ_URL=amqp://${RABBITMQ_USER:-admin}:${RABBITMQ_PASSWORD:-secure_rabbitmq_password}@rabbitmq:5672/gigglobal
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
+    expose:
+      - "4006"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - gigglobal_network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+
+  review:
+    container_name: gigglobal_review_prod
+    build:
+      context: ../server/8-review-service
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - PORT=4007
+      - POSTGRES_URL=postgresql://${POSTGRES_USER:-gigglobal}:${POSTGRES_PASSWORD:-secure_postgres_password}@postgres:5432/gigglobal_reviews
+      - RABBITMQ_URL=amqp://${RABBITMQ_USER:-admin}:${RABBITMQ_PASSWORD:-secure_rabbitmq_password}@rabbitmq:5672/gigglobal
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
+    expose:
+      - "4007"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - gigglobal_network
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+
+  client:
+    container_name: gigglobal_client_prod
+    build:
+      context: ../client
+      dockerfile: Dockerfile
+      args:
+        - NODE_ENV=production
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+    expose:
+      - "3000"
+    depends_on:
+      - gateway
+    networks:
+      - gigglobal_network
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 128M
+
+volumes:
+  redis_data:
+    driver: local
+  mongodb_data:
+    driver: local
+  mongodb_config:
+    driver: local
+  mysql_data:
+    driver: local
+  postgres_data:
+    driver: local
+  rabbitmq_data:
+    driver: local
+  elasticsearch_data:
+    driver: local
+  nginx_logs:
+    driver: local
+
+networks:
+  gigglobal_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
